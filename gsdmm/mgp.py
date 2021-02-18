@@ -2,9 +2,12 @@ from numpy.random import multinomial
 from numpy import log, exp
 from numpy import argmax
 import json
+import pandas as pd
+import numpy as np
+from sklearn import metrics
 
 class MovieGroupProcess:
-    def __init__(self, K=8, alpha=0.1, beta=0.1, n_iters=30):
+    def __init__(self, K=8, alpha=0.1, beta=0.1, n_iters=30, vectorizer = None):
         '''
         A MovieGroupProcess is a conceptual model introduced by Yin and Wang 2014 to
         describe their Gibbs sampling algorithm for a Dirichlet Mixture Model for the
@@ -29,11 +32,17 @@ class MovieGroupProcess:
             that students desire to sit with students of similar interests. A high beta means they are less
             concerned with affinity and are more influenced by the popularity of a table
         :param n_iters:
+        :param vectorizer: a vectorizer object from sklearn.feature_extraction.text, would reccomend using Tfidf
+            This is used to prioritize less common words, but it can keep the number of classes higher than 
+            would be without the vectorizer. Helpful if the corpus has words of varying frequency, and you care more
+            about the more unique words but still would like to keep the more common words. May need to try a brief
+            parameter sweep on this vectorizer to get ideal clusters.
         '''
         self.K = K
         self.alpha = alpha
         self.beta = beta
         self.n_iters = n_iters
+        self.vectorizer = vectorizer
 
         # slots for computed variables
         self.number_docs = None
@@ -41,6 +50,8 @@ class MovieGroupProcess:
         self.cluster_doc_count = [0 for _ in range(K)]
         self.cluster_word_count = [0 for _ in range(K)]
         self.cluster_word_distribution = [{} for i in range(K)]
+        self.idf_dict = None
+        self.silhouettes = None
 
     @staticmethod
     def from_data(K, alpha, beta, D, vocab_size, cluster_doc_count, cluster_word_count, cluster_word_distribution):
@@ -75,7 +86,7 @@ class MovieGroupProcess:
         '''
         return [i for i, entry in enumerate(multinomial(1, p)) if entry != 0][0]
 
-    def fit(self, docs, vocab_size):
+    def fit(self, docs):
         '''
         Cluster the input documents
         :param docs: list of list
@@ -84,16 +95,35 @@ class MovieGroupProcess:
         :return: list of length len(doc)
             cluster label for each document
         '''
-        alpha, beta, K, n_iters, V = self.alpha, self.beta, self.K, self.n_iters, vocab_size
+        alpha, beta, K, n_iters = self.alpha, self.beta, self.K, self.n_iters
 
         D = len(docs)
         self.number_docs = D
-        self.vocab_size = vocab_size
+        self.vocab_size = len(set(x for doc in docs for x in doc))
 
         # unpack to easy var names
         m_z, n_z, n_z_w = self.cluster_doc_count, self.cluster_word_count, self.cluster_word_distribution
+
+        # If we set a vectorizer, add some computations here, otherwise ignore
+        if self.vectorizer:
+            self.vectorizer.fit_transform([" ".join(x) for x in docs])
+            idf_dict = {}
+            for word, idf in zip(self.vectorizer.get_feature_names(), self.vectorizer.idf_):
+                idf_dict[word] = idf
+            
+            self.idf_dict = idf_dict
+            
+        if self.idf_dict:
+            docs = [[x for x in line if x in self.idf_dict.keys()] for line in docs]
+            self.vocab_size = len(set(x for doc in docs for x in doc))
+
+        print("Kept %d words" % (self.vocab_size))
+
         cluster_count = K
         d_z = [None for i in range(len(docs))]
+
+        # set up clusters
+        doc_dicts = [{} for i in range(len(docs))]
 
         # initialize the clusters
         for i, doc in enumerate(docs):
@@ -108,6 +138,21 @@ class MovieGroupProcess:
                 if word not in n_z_w[z]:
                     n_z_w[z][word] = 0
                 n_z_w[z][word] += 1
+                if word not in doc_dicts[i]:
+                    doc_dicts[i][word] = 0
+                doc_dicts[i][word] += 1
+
+        if self.idf_dict:
+            for i in range(len(doc_dicts)):
+                to_remove = []
+                for key, value in doc_dicts[i].items():
+                    if key in idf_dict.keys():
+                        doc_dicts[i][key] = value * idf_dict[key]
+                    else:
+                        to_remove.append(key)
+                for word in to_remove:
+                    del doc_dicts[i][word]
+        doc_dicts = pd.DataFrame(doc_dicts).fillna(0).to_numpy()
 
         for _iter in range(n_iters):
             total_transfers = 0
@@ -145,13 +190,18 @@ class MovieGroupProcess:
                     n_z_w[z_new][word] += 1
 
             cluster_count_new = sum([1 for v in m_z if v > 0])
-            print("In stage %d: transferred %d clusters with %d clusters populated" % (
-            _iter, total_transfers, cluster_count_new))
+            silhoutte_mean = metrics.silhouette_score(doc_dicts, d_z, metric = 'cosine')
+            ch_score = metrics.calinski_harabasz_score(doc_dicts, d_z)
+            db_score = metrics.davies_bouldin_score(doc_dicts, d_z)
+
+            print("In stage %d: transferred %d clusters with %d clusters populated. Average silhouette score: %f. Calinski Harabasz: %d. Davies Bouldin: %d." % (
+            _iter, total_transfers, cluster_count_new, silhoutte_mean, ch_score, db_score))
             if total_transfers == 0 and cluster_count_new == cluster_count and _iter>25:
                 print("Converged.  Breaking out.")
                 break
             cluster_count = cluster_count_new
         self.cluster_word_distribution = n_z_w
+        self.silhouettes = silhoutte_mean
         return d_z
 
     def score(self, doc):
